@@ -13,7 +13,7 @@ app = Flask(__name__)
 # Logging setup
 logger = logging.getLogger('shioaji')
 logger.setLevel(logging.INFO)
-handler = logging.FileHandler('/tmp/shioaji.log')
+handler = logging.FileHandler('/app/logs/shioaji.log')
 handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
 logger.handlers = [handler]
 
@@ -27,7 +27,7 @@ except Exception as e:
 
 # Global variables
 api = None
-contract_cache = {}  # Contract cache
+contract_cache = {}
 
 @app.route('/login', methods=['POST'])
 def login():
@@ -87,7 +87,7 @@ def login():
             "body": json.dumps({"message": "Login successful", "accounts": accounts}, default=str)
         }
     except Exception as e:
-        logger.error(f"Error in login: {str(e)}")
+        logger.error(f"Error in login: {str(e)}", exc_info=True)
         return {"statusCode": 500, "body": json.dumps({"error": f"Error in login: {str(e)}"})}
 
 @app.route('/fetch_all', methods=['GET'])
@@ -109,7 +109,7 @@ def fetch_all():
         process = psutil.Process()
         mem_info = process.memory_info()
         logger.info(f"Memory usage: {mem_info.rss / 1024**2:.2f} MB")
-        if mem_info.rss > 12 * 1024**3:  # 12GB threshold
+        if mem_info.rss > 10 * 1024**3:  # 10GB threshold
             logger.warning("High memory usage detected!")
             return {"statusCode": 429, "body": json.dumps({"error": "High memory usage"})}
 
@@ -125,35 +125,46 @@ def fetch_all():
                 if container is None:
                     logger.info(f"{market} not supported")
                     continue
-                for contract in list(container):
-                    if hasattr(contract, 'code'):
-                        cache_key = f"stock_{contract.code}"
-                        contract_cache[cache_key] = contract
-                        contract_cache[cache_key + "_market"] = market
-                        # Warrants check (assuming warrants in TSE/OTC with specific category)
-                        if hasattr(contract, 'category') and contract.category == "Warrant":
-                            warrant_key = f"warrant_{contract.code}"
-                            contract_cache[warrant_key] = contract
-                            contract_cache[warrant_key + "_market"] = f"{market}_Warrant"
-            # Futures
-            for contract in list(api.Contracts.Futures):
-                if hasattr(contract, 'code'):
-                    cache_key = f"futures_{contract.code}"
-                    contract_cache[cache_key] = contract
-                    contract_cache[cache_key + "_market"] = "Futures"
-            # Options
-            for contract in list(api.Contracts.Options):
-                if hasattr(contract, 'code'):
-                    cache_key = f"options_{contract.code}"
-                    contract_cache[cache_key] = contract
-                    contract_cache[cache_key + "_market"] = "Options"
-            logger.info(f"Cached {len(contract_cache)//2} contracts")
+                try:
+                    for contract in list(container):
+                        if hasattr(contract, 'code'):
+                            cache_key = f"stock_{contract.code}"
+                            contract_cache[cache_key] = contract
+                            contract_cache[cache_key + "_market"] = market
+                except Exception as e:
+                    logger.error(f"Failed to load contracts for market {market}: {str(e)}")
+                    continue
 
-        # Collect all contracts
+            # Futures
+            try:
+                for contract in list(api.Contracts.Futures):
+                    if hasattr(contract, 'code'):
+                        cache_key = f"futures_{contract.code}"
+                        contract_cache[cache_key] = contract
+                        contract_cache[cache_key + "_market"] = "Futures"
+            except Exception as e:
+                logger.error(f"Failed to load futures contracts: {str(e)}")
+                pass
+
+            # Options
+            try:
+                for contract in list(api.Contracts.Options):
+                    if hasattr(contract, 'code'):
+                        cache_key = f"options_{contract.code}"
+                        contract_cache[cache_key] = contract
+                        contract_cache[cache_key + "_market"] = "Options"
+            except Exception as e:
+                logger.error(f"Failed to load options contracts: {str(e)}")
+                pass
+
+            logger.info(f"Cached {len(contract_cache)//2} contracts")
+            if not contract_cache:
+                logger.error("No contracts loaded")
+                return {"statusCode": 500, "body": json.dumps({"error": "No contracts loaded"})}
+
         contracts = [v for k, v in contract_cache.items() if not k.endswith("_market")]
         markets = [contract_cache[k + "_market"] for k, v in contract_cache.items() if not k.endswith("_market")]
 
-        # Batch query
         batch_size = 200
         quotes = []
         for i in range(0, len(contracts), batch_size):
@@ -165,9 +176,12 @@ def fetch_all():
             except Exception as e:
                 logger.error(f"Batch {i//batch_size + 1} failed: {str(e)}")
                 continue
-            time.sleep(1)  # 1-second interval
+            time.sleep(1)
 
-        # Format response
+        if not quotes:
+            logger.error("No quotes fetched")
+            return {"statusCode": 500, "body": json.dumps({"error": "No quotes fetched"})}
+
         result = [
             {
                 "code": q.code,
@@ -182,13 +196,17 @@ def fetch_all():
             "body": json.dumps({"message": "Quotes fetched", "quotes": result}, default=str)
         }
     except Exception as e:
-        logger.error(f"Error in fetch_all: {str(e)}")
-        return {"statusCode": 500, "body": json.dumps({"error": f"Error in fetch_all: {str(e)}"})}
+        logger.error(f"Error in fetch_all: {str(e)}", exc_info=True)
+        return {"statusCode": 500, "body": json.dumps({"error": f"Internal server error: {str(e)}"})}
 
 @app.route('/quote', methods=['GET'])
 def quote():
     global api
     try:
+        if api is None:
+            logger.error("Shioaji API not initialized")
+            return {"statusCode": 500, "body": json.dumps({"error": "Shioaji API not initialized"})}
+
         code = request.args.get("code")
         type_ = request.args.get("type", "stock")
 
@@ -196,11 +214,11 @@ def quote():
             logger.error("Missing parameter: code")
             return {"statusCode": 400, "body": json.dumps({"error": "Missing parameter: code"})}
 
-        if api is None:
-            logger.error("Shioaji API not initialized")
-            return {"statusCode": 500, "body": json.dumps({"error": "Shioaji API not initialized"})}
-
-        logger.info(f"Received quote request: code={code}, type={type_}")
+        usage = api.usage()
+        logger.info(f"Usage: {usage}")
+        if usage.bytes > 0.8 * usage.limit_bytes:
+            logger.warning("Approaching daily traffic limit!")
+            return {"statusCode": 429, "body": json.dumps({"error": "Approaching traffic limit"})}
 
         contract = None
         market = None
@@ -214,9 +232,6 @@ def quote():
                     break
                 except KeyError:
                     continue
-            # Check for warrants
-            if contract and hasattr(contract, 'category') and contract.category == "Warrant":
-                market = f"{market}_Warrant"
         elif type_ == "futures":
             contract = api.Contracts.Futures[code]
             market = "Futures"
@@ -244,8 +259,10 @@ def quote():
             }, default=str)
         }
     except Exception as e:
-        logger.error(f"Error in quote: {str(e)}")
-        return {"statusCode": 500, "body": json.dumps({"error": f"Error in quote: {str(e)}"})}
+        logger.error(f"Error in quote: {str(e)}", exc_info=True)
+        return {"statusCode": 500, "body": json.dumps({"error": f"Internal server error: {str(e)}"})}
+
+# 保留原始的 /contracts 和 /contract 路由（未顯示，假設不變）
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
