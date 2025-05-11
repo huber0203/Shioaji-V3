@@ -1,0 +1,4 @@
+flask
+shioaji
+psutil
+gunicorn
