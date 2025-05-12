@@ -5,19 +5,18 @@ import logging
 import os
 import socket
 import sys
-import time
-import psutil
 
 app = Flask(__name__)
 
-# Logging setup
+# 設置日誌，寫入 /tmp/shioaji.log
 logger = logging.getLogger('shioaji')
 logger.setLevel(logging.INFO)
-handler = logging.FileHandler('/app/logs/shioaji.log')
-handler.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+handler = logging.FileHandler('/tmp/shioaji.log')
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+handler.setFormatter(formatter)
 logger.handlers = [handler]
 
-# Log service IP
+# 記錄服務的 IP 位址
 try:
     hostname = socket.gethostname()
     ip_address = socket.gethostbyname(hostname)
@@ -25,9 +24,8 @@ try:
 except Exception as e:
     logger.error(f"Failed to get IP address: {str(e)}")
 
-# Global variables
+# 全局變數，用於儲存 Shioaji API 實例
 api = None
-contract_cache = {}
 
 @app.route('/login', methods=['POST'])
 def login():
@@ -35,8 +33,9 @@ def login():
     try:
         data = request.get_json()
         if not data:
-            logger.error("Request body is empty")
-            return {"statusCode": 400, "body": json.dumps({"error": "Request body is empty"})}
+            error_msg = "Request body is empty"
+            logger.error(error_msg)
+            return {"statusCode": 400, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
 
         api_key = data.get("api_key")
         secret_key = data.get("secret_key")
@@ -57,22 +56,29 @@ def login():
                 missing_params.append("person_id")
 
         if missing_params:
-            logger.error(f"Missing parameters: {', '.join(missing_params)}")
-            return {"statusCode": 400, "body": json.dumps({"error": f"Missing parameters: {', '.join(missing_params)}"})}
+            error_msg = f"Missing required parameters: {', '.join(missing_params)}"
+            logger.error(error_msg)
+            return {"statusCode": 400, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
 
-        if not simulation_mode and not os.path.exists(ca_path):
-            logger.error(f"CA file not found at {ca_path}")
-            return {"statusCode": 500, "body": json.dumps({"error": f"CA file not found at {ca_path}"})}
+        if not simulation_mode:
+            if not os.path.exists(ca_path):
+                error_msg = f"CA file not found at {ca_path}"
+                logger.error(error_msg)
+                return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+            logger.info(f"CA file found at {ca_path}")
 
+        logger.info(f"Received login request: api_key={api_key[:4]}****, secret_key={secret_key[:4]}****")
         logger.info(f"Initializing Shioaji with simulation={simulation_mode}")
         api = sj.Shioaji(simulation=simulation_mode)
 
         if not simulation_mode:
-            logger.info(f"Activating CA with ca_path={ca_path}")
+            logger.info(f"Activating CA with ca_path={ca_path}, person_id={person_id}")
             result = api.activate_ca(ca_path=ca_path, ca_passwd=ca_password, person_id=person_id)
             if not result:
-                logger.error("Failed to activate CA")
-                return {"statusCode": 500, "body": json.dumps({"error": "Failed to activate CA"})}
+                error_msg = "Failed to activate CA"
+                logger.error(error_msg)
+                return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+            logger.info("CA activated successfully")
 
         logger.info("Logging into Shioaji")
         accounts = api.login(api_key=api_key, secret_key=secret_key)
@@ -84,191 +90,341 @@ def login():
 
         return {
             "statusCode": 200,
-            "body": json.dumps({"message": "Login successful", "accounts": accounts}, default=str)
+            "body": json.dumps({"message": "Login successful", "accounts": accounts}, default=str, ensure_ascii=False)
         }
+
     except Exception as e:
-        logger.error(f"Error in login: {str(e)}", exc_info=True)
-        return {"statusCode": 500, "body": json.dumps({"error": f"Error in login: {str(e)}"})}
-
-@app.route('/fetch_all', methods=['GET'])
-def fetch_all():
-    global api, contract_cache
-    try:
-        if api is None:
-            logger.error("Shioaji API not initialized")
-            return {"statusCode": 500, "body": json.dumps({"error": "Shioaji API not initialized"})}
-
-        # Check traffic usage
-        usage = api.usage()
-        logger.info(f"Usage: {usage}")
-        if usage.bytes > 0.8 * usage.limit_bytes:
-            logger.warning("Approaching daily traffic limit!")
-            return {"statusCode": 429, "body": json.dumps({"error": "Approaching traffic limit"})}
-
-        # Check memory usage
-        process = psutil.Process()
-        mem_info = process.memory_info()
-        logger.info(f"Memory usage: {mem_info.rss / 1024**2:.2f} MB")
-        if mem_info.rss > 10 * 1024**3:  # 10GB threshold
-            logger.warning("High memory usage detected!")
-            return {"statusCode": 429, "body": json.dumps({"error": "High memory usage"})}
-
-        # Populate contract cache
-        if not contract_cache:
-            logger.info("Populating contract cache")
-            # Stocks (TSE, OTC, OES)
-            for market, container in [
-                ("TSE", api.Contracts.Stocks.TSE),
-                ("OTC", api.Contracts.Stocks.OTC),
-                ("OES", getattr(api.Contracts.Stocks, "OES", None))
-            ]:
-                if container is None:
-                    logger.info(f"{market} not supported")
-                    continue
-                try:
-                    contracts_list = list(container)
-                    logger.info(f"Loaded {len(contracts_list)} contracts from {market}")
-                    for contract in contracts_list:
-                        if hasattr(contract, 'code'):
-                            cache_key = f"stock_{contract.code}"
-                            contract_cache[cache_key] = contract
-                            contract_cache[cache_key + "_market"] = market
-                except Exception as e:
-                    logger.error(f"Failed to load contracts for market {market}: {str(e)}")
-                    continue
-
-            # Futures
-            try:
-                futures_list = list(api.Contracts.Futures)
-                logger.info(f"Loaded {len(futures_list)} futures contracts")
-                for contract in futures_list:
-                    if hasattr(contract, 'code'):
-                        cache_key = f"futures_{contract.code}"
-                        contract_cache[cache_key] = contract
-                        contract_cache[cache_key + "_market"] = "Futures"
-            except Exception as e:
-                logger.error(f"Failed to load futures contracts: {str(e)}")
-                pass
-
-            # Options
-            try:
-                options_list = list(api.Contracts.Options)
-                logger.info(f"Loaded {len(options_list)} options contracts")
-                for contract in options_list:
-                    if hasattr(contract, 'code'):
-                        cache_key = f"options_{contract.code}"
-                        contract_cache[cache_key] = contract
-                        contract_cache[cache_key + "_market"] = "Options"
-            except Exception as e:
-                logger.error(f"Failed to load options contracts: {str(e)}")
-                pass
-
-            logger.info(f"Cached {len(contract_cache)//2} contracts")
-            if not contract_cache:
-                logger.error("No contracts loaded")
-                return {"statusCode": 500, "body": json.dumps({"error": "No contracts loaded"})}
-
-        contracts = [v for k, v in contract_cache.items() if not k.endswith("_market")]
-        markets = [contract_cache[k + "_market"] for k, v in contract_cache.items() if not k.endswith("_market")]
-
-        batch_size = 200
-        quotes = []
-        for i in range(0, len(contracts), batch_size):
-            batch = contracts[i:i + batch_size]
-            logger.info(f"Fetching batch {i//batch_size + 1}: {len(batch)} contracts")
-            try:
-                batch_quotes = api.snapshots(batch)
-                quotes.extend(batch_quotes)
-            except Exception as e:
-                logger.error(f"Batch {i//batch_size + 1} failed: {str(e)}")
-                continue
-            time.sleep(1)
-
-        if not quotes:
-            logger.error("No quotes fetched")
-            return {"statusCode": 500, "body": json.dumps({"error": "No quotes fetched"})}
-
-        result = [
-            {
-                "code": q.code,
-                "market": markets[i],
-                "price": q.close if hasattr(q, 'close') else None,
-                "timestamp": q.ts if hasattr(q, 'ts') else None
-            } for i, q in enumerate(quotes)
-        ]
-
-        return {
-            "statusCode": 200,
-            "body": json.dumps({"message": "Quotes fetched", "quotes": result}, default=str)
-        }
-    except Exception as e:
-        logger.error(f"Error in fetch_all: {str(e)}", exc_info=True)
-        return {"statusCode": 500, "body": json.dumps({"error": f"Internal server error: {str(e)}"})}
+        error_msg = f"Error in login: {str(e)}"
+        logger.error(error_msg)
+        logger.error(f"Exception type: {type(e).__name__}")
+        logger.error(f"Exception traceback: {sys.exc_info()}")
+        return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
 
 @app.route('/quote', methods=['GET'])
 def quote():
     global api
     try:
-        if api is None:
-            logger.error("Shioaji API not initialized")
-            return {"statusCode": 500, "body": json.dumps({"error": "Shioaji API not initialized"})}
-
-        code = request.args.get("code")
-        type_ = request.args.get("type", "stock")
+        code = request.args.get("code")  # 使用官方參數 "code"
+        type_ = request.args.get("type", "stock")  # 預設為 stock
 
         if not code:
-            logger.error("Missing parameter: code")
-            return {"statusCode": 400, "body": json.dumps({"error": "Missing parameter: code"})}
+            error_msg = "Missing required parameter: code"
+            logger.error(error_msg)
+            return {"statusCode": 400, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
 
-        usage = api.usage()
-        logger.info(f"Usage: {usage}")
-        if usage.bytes > 0.8 * usage.limit_bytes:
-            logger.warning("Approaching daily traffic limit!")
-            return {"statusCode": 429, "body": json.dumps({"error": "Approaching traffic limit"})}
+        if api is None:
+            error_msg = "Shioaji API not initialized. Please login first."
+            logger.error(error_msg)
+            return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
 
+        logger.info(f"Received quote request: code={code}, type={type_}")
+
+        # 根據 type 選擇合約類型
         contract = None
         market = None
+
         if type_ == "stock":
-            for m, c in [("TSE", api.Contracts.Stocks.TSE), ("OTC", api.Contracts.Stocks.OTC), ("OES", getattr(api.Contracts.Stocks, "OES", None))]:
-                if c is None:
-                    continue
+            # 嘗試從 TSE 查詢股票合約
+            logger.info(f"Fetching contract for code={code} from TSE")
+            contract = api.Contracts.Stocks.TSE[code]
+            market = "TSE"
+
+            # 如果 TSE 中找不到，嘗試從 OTC 查詢
+            if contract is None:
+                logger.info(f"Contract not found in TSE, trying OTC for code={code}")
+                contract = api.Contracts.Stocks.OTC[code]
+                market = "OTC"
+
+            # 如果 OTC 中找不到，嘗試從 OES（興櫃）查詢
+            if contract is None:
+                logger.info(f"Contract not found in OTC, trying OES for code={code}")
                 try:
-                    contract = c[code]
-                    market = m
-                    break
-                except KeyError:
-                    continue
+                    contract = api.Contracts.Stocks.OES[code]
+                    market = "OES"
+                except AttributeError:
+                    logger.info("OES market not supported or accessible in this context")
+
+            if contract is None:
+                error_msg = f"Contract not found for code={code} in TSE, OTC, or OES"
+                logger.error(error_msg)
+                return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+
         elif type_ == "futures":
+            # 查詢期貨合約
+            logger.info(f"Fetching futures contract for code={code}")
             contract = api.Contracts.Futures[code]
             market = "Futures"
+
+            if contract is None:
+                logger.info(f"Contract not found for code={code}, listing available futures contracts")
+                available_futures = {c.code: c.__dict__ for c in list(api.Contracts.Futures) if hasattr(c, 'code')}
+                logger.info(f"Available futures contracts: {json.dumps(available_futures, default=str)}")
+                error_msg = f"Futures contract not found for code={code}"
+                logger.error(error_msg)
+                return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+
         elif type_ == "options":
+            # 查詢選擇權合約
+            logger.info(f"Fetching options contract for code={code}")
             contract = api.Contracts.Options[code]
             market = "Options"
+
+            if contract is None:
+                error_msg = f"Options contract not found for code={code}"
+                logger.error(error_msg)
+                return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+
+        elif type_ == "index":
+            # 查詢指數合約
+            logger.info(f"Fetching index contract for code={code} from TSE")
+            contract = api.Contracts.Indexs.TSE[code]
+            market = "Index"
+
+            if contract is None:
+                error_msg = f"Index contract not found for code={code} in TSE"
+                logger.error(error_msg)
+                return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+
         else:
-            logger.error(f"Unsupported type: {type_}")
-            return {"statusCode": 400, "body": json.dumps({"error": f"Unsupported type: {type_}"})}
+            error_msg = f"Unsupported type: {type_}. Supported types are: stock, futures, options, index"
+            logger.error(error_msg)
+            return {"statusCode": 400, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
 
-        if contract is None:
-            logger.error(f"Contract not found for code={code}, type={type_}")
-            return {"statusCode": 500, "body": json.dumps({"error": f"Contract not found for code={code}"})}
+        # 記錄合約資料
+        logger.info(f"Contract found in {market}: {json.dumps(contract.__dict__, default=str)}")
 
-        logger.info(f"Fetching quote for code={code}")
+        # 查詢快照資料
+        logger.info(f"Fetching quote for code={code} (type={type_})")
         quote = api.snapshots([contract])[0]
+        logger.info(f"Quote fetched successfully: {json.dumps(quote, default=str)}")
 
         return {
             "statusCode": 200,
             "body": json.dumps({
                 "message": "Quote fetched",
-                "quote": {"code": quote.code, "price": quote.close, "timestamp": quote.ts},
+                "quote": quote,
                 "market": market,
                 "type": type_
-            }, default=str)
+            }, default=str, ensure_ascii=False)
         }
-    except Exception as e:
-        logger.error(f"Error in quote: {str(e)}", exc_info=True)
-        return {"statusCode": 500, "body": json.dumps({"error": f"Internal server error: {str(e)}"})}
 
-# 保留原始的 /contracts 和 /contract 路由（未顯示，假設不變）
+    except KeyError as ke:
+        error_msg = f"Contract not found for code={code} (type={type_}, KeyError: {str(ke)})"
+        logger.error(error_msg)
+        return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+    except Exception as e:
+        error_msg = f"Error in quote: {str(e)} (type={type_})"
+        logger.error(error_msg)
+        logger.error(f"Exception type: {type(e).__name__}")
+        logger.error(f"Exception traceback: {sys.exc_info()}")
+        return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+
+@app.route('/contracts', methods=['GET'])
+def get_contracts():
+    global api
+    try:
+        if api is None:
+            error_msg = "Shioaji API not initialized. Please login first."
+            logger.error(error_msg)
+            return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+
+        # 獲取 TSE 股票合約資料
+        logger.info("Fetching TSE contracts")
+        tse_contracts = {}
+        for contract in list(api.Contracts.Stocks.TSE):
+            if hasattr(contract, 'code'):
+                tse_contracts[contract.code] = contract.__dict__
+        logger.info("TSE contracts fetched successfully")
+
+        # 獲取 OTC 股票合約資料
+        logger.info("Fetching OTC contracts")
+        otc_contracts = {}
+        for contract in list(api.Contracts.Stocks.OTC):
+            if hasattr(contract, 'code'):
+                otc_contracts[contract.code] = contract.__dict__
+        logger.info("OTC contracts fetched successfully")
+
+        # 獲取 OES（興櫃）股票合約資料
+        logger.info("Fetching OES contracts")
+        oes_contracts = {}
+        try:
+            for contract in list(api.Contracts.Stocks.OES):
+                if hasattr(contract, 'code'):
+                    oes_contracts[contract.code] = contract.__dict__
+            logger.info("OES contracts fetched successfully")
+        except AttributeError:
+            logger.info("OES market not supported or accessible in this context")
+            oes_contracts = {}
+
+        # 獲取期貨合約資料
+        logger.info("Fetching Futures contracts")
+        futures_contracts = {}
+        for contract in list(api.Contracts.Futures):
+            if hasattr(contract, 'code'):
+                futures_contracts[contract.code] = contract.__dict__
+        logger.info("Futures contracts fetched successfully")
+
+        # 獲取選擇權合約資料
+        logger.info("Fetching Options contracts")
+        options_contracts = {}
+        for contract in list(api.Contracts.Options):
+            if hasattr(contract, 'code'):
+                options_contracts[contract.code] = contract.__dict__
+        logger.info("Options contracts fetched successfully")
+
+        # 獲取指數合約資料
+        logger.info("Fetching Index contracts")
+        index_contracts = {}
+        for contract in list(api.Contracts.Indexs.TSE):
+            if hasattr(contract, 'code'):
+                index_contracts[contract.code] = contract.__dict__
+        logger.info("Index contracts fetched successfully")
+
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "Contracts fetched",
+                "tse_contracts": tse_contracts,
+                "otc_contracts": otc_contracts,
+                "oes_contracts": oes_contracts,
+                "futures_contracts": futures_contracts,
+                "options_contracts": options_contracts,
+                "index_contracts": index_contracts
+            }, default=str, ensure_ascii=False)
+        }
+
+    except Exception as e:
+        error_msg = f"Error in contracts: {str(e)}"
+        logger.error(error_msg)
+        logger.error(f"Exception type: {type(e).__name__}")
+        logger.error(f"Exception traceback: {sys.exc_info()}")
+        return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+
+@app.route('/contract', methods=['GET'])
+def get_contract():
+    global api
+    try:
+        code = request.args.get("code")  # 使用官方參數 "code"
+        type_ = request.args.get("type", "stock")  # 預設為 stock
+
+        if not code:
+            error_msg = "Missing required parameter: code"
+            logger.error(error_msg)
+            return {"statusCode": 400, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+
+        if api is None:
+            error_msg = "Shioaji API not initialized. Please login first."
+            logger.error(error_msg)
+            return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+
+        logger.info(f"Received contract request: code={code}, type={type_}")
+
+        # 根據 type 選擇合約類型
+        contract = None
+        market = None
+
+        if type_ == "stock":
+            # 嘗試從 TSE 查詢股票合約
+            logger.info(f"Fetching contract for code={code} from TSE")
+            contract = api.Contracts.Stocks.TSE[code]
+            market = "TSE"
+
+            # 如果 TSE 中找不到，嘗試從 OTC 查詢
+            if contract is None:
+                logger.info(f"Contract not found in TSE, trying OTC for code={code}")
+                contract = api.Contracts.Stocks.OTC[code]
+                market = "OTC"
+
+            # 如果 OTC 中找不到，嘗試從 OES（興櫃）查詢
+            if contract is None:
+                logger.info(f"Contract not found in OTC, trying OES for code={code}")
+                try:
+                    contract = api.Contracts.Stocks.OES[code]
+                    market = "OES"
+                except AttributeError:
+                    logger.info("OES market not supported or accessible in this context")
+
+            if contract is None:
+                error_msg = f"Contract not found for code={code} in TSE, OTC, or OES"
+                logger.error(error_msg)
+                return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+
+        elif type_ == "futures":
+            # 查詢期貨合約
+            logger.info(f"Fetching futures contract for code={code}")
+            # 嘗試直接使用 code 查找
+            contract = api.Contracts.Futures[code]
+            market = "Futures"
+
+            # 如果找不到，嘗試列出所有期貨合約進行診斷
+            if contract is None:
+                logger.info(f"Contract not found for code={code}, listing available futures contracts")
+                available_futures = {c.code: c.__dict__ for c in list(api.Contracts.Futures) if hasattr(c, 'code')}
+                logger.info(f"Available futures contracts: {json.dumps(available_futures, default=str)}")
+                error_msg = f"Futures contract not found for code={code}"
+                logger.error(error_msg)
+                return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+
+        elif type_ == "options":
+            # 查詢選擇權合約
+            logger.info(f"Fetching options contract for code={code}")
+            contract = api.Contracts.Options[code]
+            market = "Options"
+
+            if contract is None:
+                error_msg = f"Options contract not found for code={code}"
+                logger.error(error_msg)
+                return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+
+        elif type_ == "index":
+            # 查詢指數合約
+            logger.info(f"Fetching index contract for code={code} from TSE")
+            contract = api.Contracts.Indexs.TSE[code]
+            market = "Index"
+
+            if contract is None:
+                error_msg = f"Index contract not found for code={code} in TSE"
+                logger.error(error_msg)
+                return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+
+        else:
+            error_msg = f"Unsupported type: {type_}. Supported types are: stock, futures, options, index"
+            logger.error(error_msg)
+            return {"statusCode": 400, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+
+        # 返回商品檔資訊
+        return {
+            "statusCode": 200,
+            "body": json.dumps({
+                "message": "Contract fetched",
+                "contract": {
+                    "exchange": contract.exchange.value if hasattr(contract, 'exchange') else None,
+                    "code": contract.code if hasattr(contract, 'code') else None,
+                    "symbol": contract.symbol if hasattr(contract, 'symbol') else None,
+                    "name": contract.name if hasattr(contract, 'name') else None,
+                    "category": contract.category if hasattr(contract, 'category') else None,
+                    "unit": contract.unit if hasattr(contract, 'unit') else None,
+                    "limit_up": contract.limit_up if hasattr(contract, 'limit_up') else None,
+                    "limit_down": contract.limit_down if hasattr(contract, 'limit_down') else None,
+                    "reference": contract.reference if hasattr(contract, 'reference') else None,
+                    "update_date": contract.update_date if hasattr(contract, 'update_date') else None,
+                    "day_trade": contract.day_trade.value if hasattr(contract, 'day_trade') else None
+                },
+                "market": market,
+                "type": type_
+            }, default=str, ensure_ascii=False)
+        }
+
+    except KeyError as ke:
+        error_msg = f"Contract not found for code={code} (type={type_}, KeyError: {str(ke)})"
+        logger.error(error_msg)
+        return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
+    except Exception as e:
+        error_msg = f"Error in contract: {str(e)} (type={type_})"
+        logger.error(error_msg)
+        logger.error(f"Exception type: {type(e).__name__}")
+        logger.error(f"Exception traceback: {sys.exc_info()}")
+        return {"statusCode": 500, "body": json.dumps({"error": error_msg}, ensure_ascii=False)}
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
