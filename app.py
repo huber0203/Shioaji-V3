@@ -126,7 +126,9 @@ def fetch_all():
                     logger.info(f"{market} not supported")
                     continue
                 try:
-                    for contract in list(container):
+                    contracts_list = list(container)
+                    logger.info(f"Loaded {len(contracts_list)} contracts from {market}")
+                    for contract in contracts_list:
                         if hasattr(contract, 'code'):
                             cache_key = f"stock_{contract.code}"
                             contract_cache[cache_key] = contract
@@ -137,7 +139,9 @@ def fetch_all():
 
             # Futures
             try:
-                for contract in list(api.Contracts.Futures):
+                futures_list = list(api.Contracts.Futures)
+                logger.info(f"Loaded {len(futures_list)} futures contracts")
+                for contract in futures_list:
                     if hasattr(contract, 'code'):
                         cache_key = f"futures_{contract.code}"
                         contract_cache[cache_key] = contract
@@ -148,7 +152,9 @@ def fetch_all():
 
             # Options
             try:
-                for contract in list(api.Contracts.Options):
+                options_list = list(api.Contracts.Options)
+                logger.info(f"Loaded {len(options_list)} options contracts")
+                for contract in options_list:
                     if hasattr(contract, 'code'):
                         cache_key = f"options_{contract.code}"
                         contract_cache[cache_key] = contract
